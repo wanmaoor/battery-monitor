@@ -1,0 +1,66 @@
+#!/bin/zsh
+set -euo pipefail
+
+CONFIG_FILE="${BATTERY_DRAIN_MONITOR_CONFIG:-$HOME/.config/battery-drain-monitor/config}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+: "${BATTERY_DRAIN_MONITOR_TOP_N:=20}"
+: "${BATTERY_DRAIN_MONITOR_SAMPLE_MS:=3000}"
+: "${BATTERY_DRAIN_MONITOR_STATE_DIR:=$HOME/.local/state/battery-drain-monitor}"
+: "${BATTERY_DRAIN_MONITOR_REPORT_DIR:=$HOME/battery}"
+: "${BATTERY_DRAIN_MONITOR_TEMP_LOG:=$HOME/.local/state/battery-temp-monitor/status.log}"
+
+STATE_DIR="$BATTERY_DRAIN_MONITOR_STATE_DIR"
+REPORT_DIR="$BATTERY_DRAIN_MONITOR_REPORT_DIR"
+
+mkdir -p "$STATE_DIR" "$REPORT_DIR"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  battery-drain-monitor --once
+  battery-drain-monitor --help
+
+Environment/config variables:
+  BATTERY_DRAIN_MONITOR_TOP_N=20
+  BATTERY_DRAIN_MONITOR_SAMPLE_MS=3000
+  BATTERY_DRAIN_MONITOR_STATE_DIR=~/.local/state/battery-drain-monitor
+  BATTERY_DRAIN_MONITOR_REPORT_DIR=~/battery
+  BATTERY_DRAIN_MONITOR_TEMP_LOG=~/.local/state/battery-temp-monitor/status.log
+EOF
+}
+
+timestamp_iso() {
+  /bin/date '+%Y-%m-%dT%H:%M:%S'
+}
+
+run_once() {
+  local ts pm_tmp
+  ts="$(timestamp_iso)"
+  pm_tmp="$(/usr/bin/mktemp "$STATE_DIR/pm.XXXXXX")"
+
+  sudo /usr/bin/powermetrics -n 1 -i "$BATTERY_DRAIN_MONITOR_SAMPLE_MS" \
+    --samplers tasks,cpu_power,gpu_power,ane_power \
+    > "$pm_tmp" 2>/dev/null
+
+  battery-report-gen \
+    --update \
+    --pm-output   "$pm_tmp" \
+    --timestamp   "$ts" \
+    --sys-csv     "$STATE_DIR/drain_sys.csv" \
+    --procs-csv   "$STATE_DIR/drain_procs.csv" \
+    --temp-log    "$BATTERY_DRAIN_MONITOR_TEMP_LOG" \
+    --output      "$REPORT_DIR/index.html" \
+    --top-n       "$BATTERY_DRAIN_MONITOR_TOP_N"
+
+  /bin/rm -f "$pm_tmp"
+}
+
+case "${1:-}" in
+  --once) run_once ;;
+  --help|-h) usage ;;
+  *) usage >&2; exit 64 ;;
+esac

@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""Battery dashboard: parse powermetrics → write CSVs → generate ~/battery/index.html."""
+
+import argparse
+import csv
+import io
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--update',      action='store_true', help='Parse powermetrics and update CSVs before generating HTML')
+    p.add_argument('--pm-output',   help='Path to raw powermetrics output file (required with --update)')
+    p.add_argument('--timestamp',   help='ISO timestamp for this sample (required with --update)')
+    p.add_argument('--sys-csv',     default=str(Path.home() / '.local/state/battery-drain-monitor/drain_sys.csv'))
+    p.add_argument('--procs-csv',   default=str(Path.home() / '.local/state/battery-drain-monitor/drain_procs.csv'))
+    p.add_argument('--temp-log',    default=str(Path.home() / '.local/state/battery-temp-monitor/status.log'))
+    p.add_argument('--output',      default=str(Path.home() / 'battery/index.html'))
+    p.add_argument('--top-n',       type=int, default=20)
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Powermetrics parsing
+# ---------------------------------------------------------------------------
+
+def parse_powermetrics(text, top_n):
+    """Return dict with cpu_mw, gpu_mw, ane_mw, processes list."""
+    result = {'cpu_mw': 0.0, 'gpu_mw': 0.0, 'ane_mw': 0.0, 'processes': []}
+
+    in_tasks = False
+    task_header_seen = False
+    cpu_power_seen = False
+    total_cpu_ms = 0.0
+
+    for line in text.splitlines():
+        s = line.strip()
+
+        # Section markers
+        if '*** Running tasks' in line:
+            in_tasks = True
+            task_header_seen = False
+            continue
+        if line.startswith('****') and in_tasks:
+            in_tasks = False
+
+        # Power lines (appear in **** Processor usage **** section)
+        m = re.match(r'^CPU Power:\s*([\d.]+)\s*mW', s)
+        if m:
+            result['cpu_mw'] = float(m.group(1))
+            cpu_power_seen = True
+            continue
+        m = re.match(r'^GPU Power:\s*([\d.]+)\s*mW', s)
+        if m and cpu_power_seen and result['gpu_mw'] == 0:
+            result['gpu_mw'] = float(m.group(1))
+            continue
+        m = re.match(r'^ANE Power:\s*([\d.]+)\s*mW', s)
+        if m:
+            result['ane_mw'] = float(m.group(1))
+            continue
+
+        # Task lines
+        if in_tasks:
+            if 'Name' in line and 'ID' in line and 'CPU ms/s' in line:
+                task_header_seen = True
+                continue
+            if task_header_seen and s:
+                parts = re.split(r'  +', s)
+                if len(parts) < 3:
+                    continue
+                try:
+                    pid = int(parts[1].strip())
+                    cpu_ms = float(re.sub(r'[^\d.]', '', parts[2].strip()) or '0')
+                except ValueError:
+                    continue
+                if pid <= 0:
+                    continue
+                total_cpu_ms += cpu_ms
+                result['processes'].append({
+                    'pid': str(pid),
+                    'process': parts[0].strip(),
+                    'cpu_ms_s': cpu_ms,
+                })
+
+    # Compute per-process derived metrics
+    for proc in result['processes']:
+        proc['cpu_pct'] = round(proc['cpu_ms_s'] / total_cpu_ms * 100, 2) if total_cpu_ms > 0 else 0.0
+        proc['cpu_mw_est'] = round(proc['cpu_pct'] / 100 * result['cpu_mw'], 1)
+
+    result['processes'].sort(key=lambda p: p['cpu_ms_s'], reverse=True)
+    for i, proc in enumerate(result['processes'][:top_n], 1):
+        proc['rank'] = i
+    result['processes'] = result['processes'][:top_n]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ioreg: battery info
+# ---------------------------------------------------------------------------
+
+def read_battery_ioreg():
+    try:
+        out = subprocess.check_output(
+            ['/usr/sbin/ioreg', '-rn', 'AppleSmartBattery'],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return {}
+
+    fields = {}
+    for key, pat in [
+        ('CycleCount',        r'"CycleCount" = (\d+)'),
+        ('MaxCapacity',       r'"MaxCapacity" = (\d+)'),
+        ('DesignCapacity',    r'"DesignCapacity" = (\d+)'),
+        ('CurrentCapacity',   r'"CurrentCapacity" = (\d+)'),
+        ('Amperage',          r'"Amperage" = (-?\d+)'),
+        ('Voltage',           r'"Voltage" = (\d+)'),
+        ('ExternalConnected', r'"ExternalConnected" = (\w+)'),
+        ('IsCharging',        r'"IsCharging" = (\w+)'),
+    ]:
+        m = re.search(pat, out)
+        if m:
+            v = m.group(1)
+            if v in ('Yes', 'No'):
+                fields[key] = (v == 'Yes')
+            else:
+                fields[key] = int(v)
+    return fields
+
+
+def compute_total_mw(ioreg):
+    """Return total battery drain in mW (0 if charging or no data)."""
+    amp = ioreg.get('Amperage', 0)
+    volt = ioreg.get('Voltage', 0)
+    if amp >= 0 or volt <= 0:
+        return 0.0
+    # amp is negative when discharging (mA), volt is mV → µW → mW
+    return round(abs(amp) * volt / 1000.0, 1)
+
+
+def compute_health(ioreg):
+    max_cap = ioreg.get('MaxCapacity', 0)
+    design_cap = ioreg.get('DesignCapacity', 0)
+    if max_cap <= 0:
+        return '—'
+    if max_cap <= 100:
+        return max_cap
+    if design_cap > 0:
+        return round(max_cap / design_cap * 100, 1)
+    return '—'
+
+
+# ---------------------------------------------------------------------------
+# CSV I/O
+# ---------------------------------------------------------------------------
+
+SYS_FIELDS  = ['timestamp', 'battery_pct', 'cpu_mw', 'gpu_mw', 'ane_mw', 'total_mw', 'other_mw']
+PROC_FIELDS = ['timestamp', 'rank', 'pid', 'process', 'cpu_ms_s', 'cpu_pct', 'cpu_mw_est']
+
+
+def append_sys_csv(path, row):
+    p = Path(path)
+    write_header = not p.exists()
+    with open(p, 'a', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=SYS_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+
+def append_procs_csv(path, rows):
+    p = Path(path)
+    write_header = not p.exists()
+    with open(p, 'a', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=PROC_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def read_sys_csv(path, cutoff):
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows = []
+    try:
+        with open(p, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                try:
+                    ts = datetime.fromisoformat(row['timestamp'])
+                    if ts < cutoff:
+                        continue
+                    rows.append({
+                        '_ts': ts,
+                        'timestamp': row['timestamp'],
+                        'battery_pct': int(row.get('battery_pct') or 0),
+                        'cpu_mw':   float(row.get('cpu_mw')   or 0),
+                        'gpu_mw':   float(row.get('gpu_mw')   or 0),
+                        'ane_mw':   float(row.get('ane_mw')   or 0),
+                        'total_mw': float(row.get('total_mw') or 0),
+                        'other_mw': float(row.get('other_mw') or 0),
+                    })
+                except (ValueError, KeyError):
+                    continue
+    except OSError:
+        pass
+    return rows
+
+
+def read_procs_csv(path, cutoff, top_n):
+    p = Path(path)
+    if not p.exists():
+        return {}, []
+    by_ts = {}
+    all_rows = []
+    latest_ts = None
+    try:
+        with open(p, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                try:
+                    ts = datetime.fromisoformat(row['timestamp'])
+                    if ts < cutoff:
+                        continue
+                    r = {
+                        '_ts': ts,
+                        'timestamp': row['timestamp'],
+                        'rank': int(row.get('rank') or 0),
+                        'pid': row.get('pid', ''),
+                        'process': row.get('process', ''),
+                        'cpu_ms_s':  float(row.get('cpu_ms_s')  or 0),
+                        'cpu_pct':   float(row.get('cpu_pct')   or 0),
+                        'cpu_mw_est': float(row.get('cpu_mw_est') or 0),
+                    }
+                    all_rows.append(r)
+                    ts_str = row['timestamp']
+                    by_ts.setdefault(ts_str, []).append(r)
+                    if latest_ts is None or ts > latest_ts:
+                        latest_ts = ts
+                except (ValueError, KeyError):
+                    continue
+    except OSError:
+        pass
+
+    # Latest snapshot (top 10 for the table)
+    latest_snap = []
+    if latest_ts is not None:
+        latest_ts_str = latest_ts.strftime('%Y-%m-%dT%H:%M:%S')
+        latest_snap = sorted(by_ts.get(latest_ts_str, []), key=lambda r: r['rank'])[:10]
+
+    # Top 5 processes by cumulative cpu_pct for time-series chart
+    pct_sum = {}
+    for r in all_rows:
+        pct_sum[r['process']] = pct_sum.get(r['process'], 0) + r['cpu_pct']
+    top5 = sorted(pct_sum, key=lambda k: pct_sum[k], reverse=True)[:5]
+
+    # Build time series per process
+    timestamps = sorted(by_ts.keys())
+    series = {}
+    for name in top5:
+        series[name] = []
+        for ts_str in timestamps:
+            match = next((r for r in by_ts[ts_str] if r['process'] == name), None)
+            series[name].append(match['cpu_pct'] if match else None)
+
+    return {
+        'timestamps': timestamps,
+        'top5': top5,
+        'series': series,
+        'latest_snap': latest_snap,
+    }, all_rows
+
+
+# ---------------------------------------------------------------------------
+# Temperature log
+# ---------------------------------------------------------------------------
+
+def read_temp_log(path, cutoff):
+    p = Path(path)
+    if not p.exists():
+        return []
+    pattern = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) temp_c=([\d.]+)')
+    buckets = {}
+    try:
+        with open(p, encoding='utf-8') as f:
+            for line in f:
+                m = pattern.match(line.strip())
+                if not m:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
+                    if ts < cutoff:
+                        continue
+                    b = ts.replace(minute=(ts.minute // 5) * 5, second=0, microsecond=0)
+                    buckets[b] = float(m.group(2))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return [{'ts': ts.strftime('%Y-%m-%dT%H:%M:%S'), 'temp': buckets[ts]}
+            for ts in sorted(buckets)]
+
+
+def read_temp_thresholds():
+    warn, critical = 40, 45
+    cfg = Path.home() / '.config/battery-temp-monitor/config'
+    if cfg.exists():
+        text = cfg.read_text()
+        m = re.search(r'BATTERY_TEMP_MONITOR_WARN_TEMP_C=(\d+)', text)
+        if m:
+            warn = int(m.group(1))
+        m = re.search(r'BATTERY_TEMP_MONITOR_CRITICAL_TEMP_C=(\d+)', text)
+        if m:
+            critical = int(m.group(1))
+    return warn, critical
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+    now = datetime.now()
+    cutoff_7d = now - timedelta(days=7)
+
+    # --- Step 1: parse powermetrics + update CSVs (--update mode) ---
+    pm_data = None
+    battery_pct = 0
+    if args.update:
+        if not args.pm_output or not args.timestamp:
+            print('--update requires --pm-output and --timestamp', file=sys.stderr)
+            sys.exit(1)
+
+        pm_text = Path(args.pm_output).read_text(errors='replace')
+        pm_data = parse_powermetrics(pm_text, args.top_n)
+
+        ioreg = read_battery_ioreg()
+        battery_pct = ioreg.get('CurrentCapacity', 0)
+        total_mw = compute_total_mw(ioreg)
+        subtotal = pm_data['cpu_mw'] + pm_data['gpu_mw'] + pm_data['ane_mw']
+        other_mw = max(0.0, round(total_mw - subtotal, 1)) if total_mw > 0 else 0.0
+
+        sys_row = {
+            'timestamp':   args.timestamp,
+            'battery_pct': battery_pct,
+            'cpu_mw':      pm_data['cpu_mw'],
+            'gpu_mw':      pm_data['gpu_mw'],
+            'ane_mw':      pm_data['ane_mw'],
+            'total_mw':    total_mw,
+            'other_mw':    other_mw,
+        }
+        append_sys_csv(args.sys_csv, sys_row)
+
+        proc_rows = [{
+            'timestamp':   args.timestamp,
+            'rank':        proc['rank'],
+            'pid':         proc['pid'],
+            'process':     proc['process'],
+            'cpu_ms_s':    proc['cpu_ms_s'],
+            'cpu_pct':     proc['cpu_pct'],
+            'cpu_mw_est':  proc['cpu_mw_est'],
+        } for proc in pm_data['processes']]
+        append_procs_csv(args.procs_csv, proc_rows)
+
+    # --- Step 2: read historical data ---
+    ioreg = read_battery_ioreg()
+    sys_rows = read_sys_csv(args.sys_csv, cutoff_7d)
+    proc_data, _ = read_procs_csv(args.procs_csv, cutoff_7d, args.top_n)
+    temp_data = read_temp_log(args.temp_log, cutoff_7d)
+    warn_temp, critical_temp = read_temp_thresholds()
+
+    # Current power state (most recent sys row)
+    latest_sys = sys_rows[-1] if sys_rows else {}
+    current_pct = ioreg.get('CurrentCapacity', latest_sys.get('battery_pct', '—'))
+    is_charging = ioreg.get('IsCharging', False)
+    external    = ioreg.get('ExternalConnected', False)
+    if is_charging:
+        status_text, status_class = 'Charging', 'charging'
+    elif external:
+        status_text, status_class = 'AC (Full)', 'full'
+    else:
+        status_text, status_class = 'Discharging', 'discharging'
+
+    health = compute_health(ioreg)
+    cycle_count = ioreg.get('CycleCount', '—')
+
+    cur_temp = temp_data[-1]['temp'] if temp_data else None
+
+    # Current power breakdown
+    cur_cpu_mw   = latest_sys.get('cpu_mw', 0)
+    cur_gpu_mw   = latest_sys.get('gpu_mw', 0)
+    cur_ane_mw   = latest_sys.get('ane_mw', 0)
+    cur_total_mw = latest_sys.get('total_mw', 0)
+    cur_other_mw = latest_sys.get('other_mw', 0)
+
+    # Time-series arrays for charts (sys level)
+    sys_ts       = [r['timestamp'] for r in sys_rows]
+    sys_cpu_mw   = [r['cpu_mw']   for r in sys_rows]
+    sys_gpu_mw   = [r['gpu_mw']   for r in sys_rows]
+    sys_ane_mw   = [r['ane_mw']   for r in sys_rows]
+    sys_other_mw = [r['other_mw'] if r['other_mw'] > 0 else None for r in sys_rows]
+    sys_batt_pct = [r['battery_pct'] for r in sys_rows]
+
+    data = {
+        # Meta
+        'generatedAt': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'status':      status_text,
+        'statusClass': status_class,
+        # Cards
+        'currentPct':  current_pct,
+        'cycleCount':  cycle_count,
+        'healthPct':   health,
+        'curTempC':    round(cur_temp, 1) if cur_temp is not None else None,
+        # Current power breakdown
+        'curCpuMw':   cur_cpu_mw,
+        'curGpuMw':   cur_gpu_mw,
+        'curAneMw':   cur_ane_mw,
+        'curTotalMw': cur_total_mw,
+        'curOtherMw': cur_other_mw,
+        'isCharging': is_charging or external,
+        # System time-series
+        'sysTsTmz':     sys_ts,
+        'sysCpuMw':     sys_cpu_mw,
+        'sysGpuMw':     sys_gpu_mw,
+        'sysAneMw':     sys_ane_mw,
+        'sysOtherMw':   sys_other_mw,
+        'sysBattPct':   sys_batt_pct,
+        # Process time-series
+        'procTs':    proc_data.get('timestamps', []),
+        'procTop5':  proc_data.get('top5', []),
+        'procSeries': proc_data.get('series', {}),
+        'procSnap':  [
+            {
+                'rank':      r['rank'],
+                'process':   r['process'],
+                'cpuPct':    r['cpu_pct'],
+                'cpuMwEst':  r['cpu_mw_est'],
+                'cpuMsS':    r['cpu_ms_s'],
+                'pid':       r['pid'],
+            }
+            for r in proc_data.get('latest_snap', [])
+        ],
+        # Temperature
+        'tempTs':       [t['ts']   for t in temp_data],
+        'tempValues':   [t['temp'] for t in temp_data],
+        'warnTemp':     warn_temp,
+        'criticalTemp': critical_temp,
+        # Chart colors
+        'sysColors':  ['#3b82f6', '#8b5cf6', '#f59e0b', '#94a3b8'],
+        'procColors': ['#3b82f6', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6'],
+    }
+
+    html = HTML_TEMPLATE.replace('__BATT_DATA_JSON__', json.dumps(data, ensure_ascii=False))
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding='utf-8')
+    print(f'Report written: {out}', file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# HTML template
+# ---------------------------------------------------------------------------
+
+HTML_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Battery Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;color:#1d1d1f;min-height:100vh}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 20px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+h1{font-size:22px;font-weight:700;letter-spacing:-.3px}
+.gen{font-size:12px;color:#86868b}
+
+/* Status cards */
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.card{background:#fff;border-radius:14px;padding:16px 18px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card-label{font-size:11px;font-weight:500;color:#86868b;letter-spacing:.4px;text-transform:uppercase;margin-bottom:5px}
+.card-value{font-size:28px;font-weight:700;line-height:1}
+.card-unit{font-size:14px;font-weight:400}
+.card-sub{font-size:12px;margin-top:4px}
+.charging{color:#34c759}.discharging{color:#ff9500}.full{color:#007aff}
+
+/* Power breakdown panel */
+.power-panel{background:#fff;border-radius:14px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:16px}
+.power-panel h2{font-size:15px;font-weight:600;margin-bottom:14px}
+.power-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.power-row:last-child{margin-bottom:0}
+.power-name{width:80px;font-size:13px;color:#1d1d1f;font-weight:500}
+.power-bar-wrap{flex:1;height:8px;background:#e5e5ea;border-radius:4px;overflow:hidden}
+.power-bar{height:100%;border-radius:4px;transition:width .4s}
+.power-mw{width:80px;text-align:right;font-size:13px;font-variant-numeric:tabular-nums;color:#1d1d1f}
+.power-pct{width:46px;text-align:right;font-size:12px;color:#86868b;font-variant-numeric:tabular-nums}
+.power-note{font-size:12px;color:#86868b;margin-top:8px}
+.power-total{margin-top:12px;padding-top:12px;border-top:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center}
+.power-total-label{font-size:13px;font-weight:600}
+.power-total-val{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+
+/* Toggle */
+.toggle-group{display:inline-flex;border-radius:8px;overflow:hidden;border:1px solid #d1d1d6;margin-bottom:16px}
+.toggle-group button{padding:6px 20px;border:none;background:#fff;font-size:14px;cursor:pointer;transition:background .15s,color .15s}
+.toggle-group button.active{background:#007aff;color:#fff;font-weight:500}
+
+/* Charts */
+.section{background:#fff;border-radius:14px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:16px}
+.section-title{font-size:15px;font-weight:600;margin-bottom:14px}
+.chart-wrap{position:relative;height:200px}
+
+/* Table */
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{text-align:left;padding:7px 10px;font-size:11px;font-weight:500;color:#86868b;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid #e5e5ea}
+tbody td{padding:9px 10px;border-bottom:1px solid #f5f5f7}
+tbody tr:last-child td{border-bottom:none}
+.tn{font-variant-numeric:tabular-nums}.tr{text-align:right}.tm{color:#86868b;font-size:12px}
+.mini-bar{width:90px}.bar{height:5px;background:#e5e5ea;border-radius:3px;overflow:hidden}
+.bar-fill{height:100%;background:#3b82f6;border-radius:3px}
+@media(max-width:700px){.cards{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Battery Monitor</h1>
+    <span class="gen" id="gen-time"></span>
+  </header>
+
+  <!-- Status cards -->
+  <div class="cards" id="status-cards"></div>
+
+  <!-- Power breakdown -->
+  <div class="power-panel">
+    <h2>Current Power Breakdown</h2>
+    <div id="power-rows"></div>
+    <p class="power-note" id="power-note"></p>
+    <div class="power-total" id="power-total" style="display:none">
+      <span class="power-total-label">Total (from battery)</span>
+      <span class="power-total-val" id="power-total-val"></span>
+    </div>
+  </div>
+
+  <div class="toggle-group" role="group" aria-label="Time range">
+    <button id="btn-24h" class="active" onclick="setRange('24h')">24h</button>
+    <button id="btn-7d"  onclick="setRange('7d')">7d</button>
+  </div>
+
+  <!-- Charts -->
+  <div class="section">
+    <div class="section-title">System Power Over Time (mW)</div>
+    <div class="chart-wrap"><canvas id="chart-sys"></canvas></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Top Processes — CPU Usage (%)</div>
+    <div class="chart-wrap"><canvas id="chart-proc"></canvas></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Battery Temperature (°C)</div>
+    <div class="chart-wrap"><canvas id="chart-temp"></canvas></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Battery Level (%)</div>
+    <div class="chart-wrap"><canvas id="chart-batt"></canvas></div>
+  </div>
+
+  <!-- Process table -->
+  <div class="section">
+    <div class="section-title">Current Snapshot — Top Processes</div>
+    <table>
+      <thead><tr>
+        <th style="width:28px">#</th>
+        <th>Process</th>
+        <th class="tr">CPU %</th>
+        <th class="tr">~CPU mW</th>
+        <th class="tr">CPU ms/s</th>
+        <th class="mini-bar"></th>
+        <th>PID</th>
+      </tr></thead>
+      <tbody id="snap-body"></tbody>
+    </table>
+  </div>
+
+</div><!-- /wrap -->
+
+<script>
+const D = __BATT_DATA_JSON__;
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function fmtLabel(iso, hours){
+  const d = new Date(iso);
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  if(hours > 24){
+    const mo = String(d.getMonth()+1).padStart(2,'0');
+    const dd = String(d.getDate()).padStart(2,'0');
+    return mo+'-'+dd+' '+hh+':'+mm;
+  }
+  return hh+':'+mm;
+}
+
+function filterHours(ts, vals, hours){
+  if(!ts.length) return {ts:[], vals: Array.isArray(vals[0]) ? vals.map(()=>[]) : []};
+  const cutoff = Date.now() - hours*3600000;
+  let idx = ts.findIndex(s => new Date(s).getTime() >= cutoff);
+  if(idx < 0) idx = ts.length;
+  const isNested = Array.isArray(vals) && vals.length > 0 && Array.isArray(vals[0]);
+  if(isNested) return {ts: ts.slice(idx), vals: vals.map(v => v.slice(idx))};
+  return {ts: ts.slice(idx), vals: vals.slice(idx)};
+}
+
+// ── Status cards ─────────────────────────────────────────────────────────
+document.getElementById('gen-time').textContent = 'Updated ' + D.generatedAt;
+
+const tempStr = D.curTempC !== null ? D.curTempC.toFixed(1) : '—';
+document.getElementById('status-cards').innerHTML = `
+  <div class="card">
+    <div class="card-label">Battery</div>
+    <div class="card-value">${esc(String(D.currentPct))}<span class="card-unit">%</span></div>
+    <div class="card-sub ${esc(D.statusClass)}">${esc(D.status)}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Cycle Count</div>
+    <div class="card-value">${esc(String(D.cycleCount))}</div>
+    <div class="card-sub">cycles used</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Health</div>
+    <div class="card-value">${esc(String(D.healthPct))}<span class="card-unit">%</span></div>
+    <div class="card-sub">max capacity</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Temperature</div>
+    <div class="card-value">${esc(tempStr)}<span class="card-unit">°C</span></div>
+    <div class="card-sub">battery</div>
+  </div>
+`;
+
+// ── Power breakdown panel ─────────────────────────────────────────────────
+(function(){
+  const rows = [
+    {name:'CPU', mw: D.curCpuMw,   color:'#3b82f6'},
+    {name:'GPU', mw: D.curGpuMw,   color:'#8b5cf6'},
+    {name:'ANE', mw: D.curAneMw,   color:'#f59e0b'},
+  ];
+  if(!D.isCharging && D.curOtherMw > 0){
+    rows.push({name:'Other', mw: D.curOtherMw, color:'#94a3b8'});
+  }
+  const ref = D.isCharging
+    ? rows.reduce((s,r) => s+r.mw, 0)
+    : (D.curTotalMw > 0 ? D.curTotalMw : rows.reduce((s,r) => s+r.mw, 0));
+
+  const html = rows.map(r => {
+    const pct = ref > 0 ? Math.min(100,(r.mw/ref*100)).toFixed(1) : '0';
+    return `<div class="power-row">
+      <div class="power-name">${esc(r.name)}</div>
+      <div class="power-bar-wrap"><div class="power-bar" style="width:${pct}%;background:${r.color}"></div></div>
+      <div class="power-mw">${r.mw.toFixed(0)} mW</div>
+      <div class="power-pct">${pct}%</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('power-rows').innerHTML = html;
+
+  if(D.isCharging){
+    document.getElementById('power-note').textContent =
+      'Charging — total system drain from battery not available. Showing CPU+GPU+ANE only.';
+  } else if(D.curTotalMw > 0){
+    document.getElementById('power-note').textContent =
+      'Other includes display backlight, keyboard, network, Bluetooth, and storage.';
+    document.getElementById('power-total').style.display = 'flex';
+    document.getElementById('power-total-val').textContent = D.curTotalMw.toFixed(0)+' mW';
+  } else {
+    document.getElementById('power-note').textContent =
+      'Total battery drain unavailable (no discharge data yet).';
+  }
+})();
+
+// ── Snapshot table ────────────────────────────────────────────────────────
+const maxPct = Math.max(...D.procSnap.map(r => r.cpuPct), 0.01);
+document.getElementById('snap-body').innerHTML = D.procSnap.map(r => {
+  const barW = Math.min(100,(r.cpuPct/maxPct*100)).toFixed(1);
+  return `<tr>
+    <td class="tn tm">${r.rank}</td>
+    <td>${esc(r.process)}</td>
+    <td class="tn tr">${r.cpuPct.toFixed(1)}%</td>
+    <td class="tn tr">${r.cpuMwEst > 0 ? r.cpuMwEst.toFixed(0)+' mW' : '—'}</td>
+    <td class="tn tr">${r.cpuMsS.toFixed(1)}</td>
+    <td class="mini-bar"><div class="bar"><div class="bar-fill" style="width:${barW}%"></div></div></td>
+    <td class="tn tm">${esc(r.pid)}</td>
+  </tr>`;
+}).join('');
+
+// ── Chart helpers ─────────────────────────────────────────────────────────
+const TICK = {size:11,family:'-apple-system,sans-serif'};
+const GRID = '#f0f0f0';
+
+function baseOpts(yTitle, extra){
+  return Object.assign({
+    responsive:true, maintainAspectRatio:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{
+      legend:{position:'top',labels:{font:TICK,boxWidth:12,padding:10}},
+    },
+    scales:{
+      x:{ticks:{font:TICK,maxTicksLimit:10,autoSkip:true},grid:{color:GRID}},
+      y:{ticks:{font:TICK},grid:{color:GRID},beginAtZero:true,
+         title:{display:true,text:yTitle,font:TICK}},
+    },
+  }, extra||{});
+}
+
+// Initial 24h slice
+const H0=24;
+const f0sys  = filterHours(D.sysTsTmz,
+  [D.sysCpuMw, D.sysGpuMw, D.sysAneMw, D.sysOtherMw], H0);
+const f0proc = filterHours(D.procTs,
+  D.procTop5.map(n => D.procSeries[n]||[]), H0);
+const f0temp = filterHours(D.tempTs, D.tempValues, H0);
+const f0batt = filterHours(D.sysTsTmz, D.sysBattPct, H0);
+
+// ── System power chart (stacked area) ────────────────────────────────────
+const SYS_LABELS = ['CPU','GPU','ANE','Other'];
+const ctxSys = document.getElementById('chart-sys').getContext('2d');
+const chartSys = new Chart(ctxSys, {
+  type:'line',
+  data:{
+    labels: f0sys.ts.map(s=>fmtLabel(s,H0)),
+    datasets: SYS_LABELS.map((lbl,i) => ({
+      label:lbl,
+      data: f0sys.vals[i],
+      borderColor:   D.sysColors[i],
+      backgroundColor: D.sysColors[i]+'55',
+      fill:true, tension:0.3, pointRadius:0, borderWidth:2, spanGaps:true,
+    })),
+  },
+  options: baseOpts('mW',{
+    plugins:{
+      legend:{position:'top',labels:{font:TICK,boxWidth:12,padding:10}},
+      tooltip:{callbacks:{
+        label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y!=null ? ctx.parsed.y.toFixed(0)+' mW' : '—'}`,
+      }},
+    },
+  }),
+});
+
+// ── Process CPU% chart ────────────────────────────────────────────────────
+const ctxProc = document.getElementById('chart-proc').getContext('2d');
+const chartProc = new Chart(ctxProc, {
+  type:'line',
+  data:{
+    labels: f0proc.ts.map(s=>fmtLabel(s,H0)),
+    datasets: D.procTop5.map((name,i) => ({
+      label:name,
+      data: f0proc.vals[i],
+      borderColor:   D.procColors[i],
+      backgroundColor: D.procColors[i]+'22',
+      fill:false, tension:0.3, pointRadius:0, borderWidth:2, spanGaps:true,
+    })),
+  },
+  options: baseOpts('%',{
+    plugins:{
+      legend:{position:'top',labels:{font:TICK,boxWidth:12,padding:10}},
+      tooltip:{callbacks:{
+        label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y!=null ? ctx.parsed.y.toFixed(1)+'%' : '—'}`,
+      }},
+    },
+  }),
+});
+
+// ── Temperature chart ─────────────────────────────────────────────────────
+const ctxTemp = document.getElementById('chart-temp').getContext('2d');
+const chartTemp = new Chart(ctxTemp, {
+  type:'line',
+  data:{
+    labels: f0temp.ts.map(s=>fmtLabel(s,H0)),
+    datasets:[
+      {label:'Temperature', data:f0temp.vals,
+       borderColor:'#ef4444',backgroundColor:'#ef444422',
+       fill:false,tension:0.3,pointRadius:0,borderWidth:2,spanGaps:true},
+      {label:`Warn (${D.warnTemp}°C)`, data:f0temp.ts.map(()=>D.warnTemp),
+       borderColor:'#f59e0b',borderDash:[4,3],borderWidth:1.5,pointRadius:0,fill:false},
+      {label:`Critical (${D.criticalTemp}°C)`, data:f0temp.ts.map(()=>D.criticalTemp),
+       borderColor:'#ef4444',borderDash:[4,3],borderWidth:1.5,pointRadius:0,fill:false},
+    ],
+  },
+  options: baseOpts('°C',{
+    plugins:{
+      legend:{position:'top',labels:{font:TICK,boxWidth:12,padding:10}},
+      tooltip:{callbacks:{
+        label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y!=null ? ctx.parsed.y.toFixed(1)+'°C' : '—'}`,
+      }},
+    },
+  }),
+});
+
+// ── Battery level chart ───────────────────────────────────────────────────
+const ctxBatt = document.getElementById('chart-batt').getContext('2d');
+const chartBatt = new Chart(ctxBatt, {
+  type:'line',
+  data:{
+    labels: f0batt.ts.map(s=>fmtLabel(s,H0)),
+    datasets:[{
+      label:'Battery %', data:f0batt.vals,
+      borderColor:'#34c759',backgroundColor:'#34c75922',
+      fill:true,tension:0.3,pointRadius:0,borderWidth:2,spanGaps:true,
+    }],
+  },
+  options: baseOpts('%',{
+    plugins:{legend:{display:false}},
+    scales:{
+      x:{ticks:{font:TICK,maxTicksLimit:10,autoSkip:true},grid:{color:GRID}},
+      y:{ticks:{font:TICK},grid:{color:GRID},min:0,max:100,
+         title:{display:true,text:'%',font:TICK}},
+    },
+  }),
+});
+
+// ── Range toggle ──────────────────────────────────────────────────────────
+function setRange(range){
+  document.getElementById('btn-24h').classList.toggle('active',range==='24h');
+  document.getElementById('btn-7d').classList.toggle('active',range==='7d');
+  const hours = range==='24h' ? 24 : 168;
+
+  // System power
+  const fs = filterHours(D.sysTsTmz,
+    [D.sysCpuMw,D.sysGpuMw,D.sysAneMw,D.sysOtherMw], hours);
+  chartSys.data.labels = fs.ts.map(s=>fmtLabel(s,hours));
+  chartSys.data.datasets.forEach((ds,i)=>{ ds.data=fs.vals[i]; });
+  chartSys.update();
+
+  // Processes
+  const fp = filterHours(D.procTs,
+    D.procTop5.map(n=>D.procSeries[n]||[]), hours);
+  chartProc.data.labels = fp.ts.map(s=>fmtLabel(s,hours));
+  chartProc.data.datasets.forEach((ds,i)=>{ ds.data=fp.vals[i]; });
+  chartProc.update();
+
+  // Temperature
+  const ft = filterHours(D.tempTs, D.tempValues, hours);
+  chartTemp.data.labels = ft.ts.map(s=>fmtLabel(s,hours));
+  chartTemp.data.datasets[0].data = ft.vals;
+  chartTemp.data.datasets[1].data = ft.ts.map(()=>D.warnTemp);
+  chartTemp.data.datasets[2].data = ft.ts.map(()=>D.criticalTemp);
+  chartTemp.update();
+
+  // Battery level
+  const fb = filterHours(D.sysTsTmz, D.sysBattPct, hours);
+  chartBatt.data.labels = fb.ts.map(s=>fmtLabel(s,hours));
+  chartBatt.data.datasets[0].data = fb.vals;
+  chartBatt.update();
+}
+</script>
+</body>
+</html>
+'''
+
+if __name__ == '__main__':
+    main()
